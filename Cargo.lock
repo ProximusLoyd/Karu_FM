@@ -214,6 +214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7caa3f9de89ddbe2c607f4101924c5abec803763ae9534e4f4d7d8f84aa81f0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -873,6 +882,7 @@ dependencies = [
  "image 0.24.9",
  "nerd-font-symbols",
  "ratatui",
+ "soloud",
  "trash",
  "viuer",
  "xdg",
@@ -1573,6 +1583,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "soloud"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acd858ec6a193e50d4b8fe23e4e143f20e72cbfaa30b338d97c53de7f95d9add"
+dependencies = [
+ "bitflags 2.10.0",
+ "paste",
+ "soloud-sys",
+]
+
+[[package]]
+name = "soloud-sys"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24e67f2813f8e234bee15d2457e19cd7d7f8c5908b3c85b1a5b3296abb7606ab"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1929,9 +1959,9 @@ dependencies = [
 
 [[package]]
 name = "weezl"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a751b3277700db47d3e574514de2eced5e54dc8a5436a3bf7a0b248b2cee16f3"
+checksum = "009936b22a61d342859b5f0ea64681cbb35a358ab548e2a44a8cf0dac2d980b8"
 
 [[package]]
 name = "winapi"
