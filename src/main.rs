@@ -1,26 +1,44 @@
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use image;
 use nerd_font_symbols::md;
 use ratatui::{
     prelude::*,
-    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::{
     env,
-    error::Error,
     fs,
-    io::{self},
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Stdio,
 };
 use trash;
-use unicode_width;
 use viuer;
+use open;
+
+const ACTIONS: &[(&str, &str)] = &[
+    ("Cut", "X"),
+    ("Copy", "C"),
+    ("Paste", "P"),
+    ("Delete", "D"),
+    ("Rename", "R"),
+    ("Create", "N"),
+    ("Create Directory", "+"),
+    ("Move", "M"),
+    ("Open", "O"),
+    ("Toggle Hidden", "Shift+H"),
+];
+const VIM_KEY_HINTS: &[(&str, &str, &str)] = &[
+    ("j", "Down Arrow", "Move down in file list"),
+    ("k", "Up Arrow", "Move up in file list"),
+    ("h", "Left Arrow", "Unfocus actions panel / Go up directory"),
+    ("l", "Right Arrow", "Focus actions panel / Open selected"),
+    ("q", "Quit", "Quit the application"),
+];
+
 #[derive(PartialEq)]
 enum AppMode {
     Normal,
@@ -29,25 +47,13 @@ enum AppMode {
     Create,
     Rename,
     Filter,
-    View,
-    Edit,
     CreateDirectory,
     Move,
-    Find,
-    Replace,
 }
 #[derive(PartialEq)]
 enum PanelFocus {
     Files,
     Actions,
-    TopBarButtons,
-}
-#[derive(PartialEq)]
-enum TopBarFocus {
-    AddressBar,
-    PrevButton,
-    NextButton,
-    UpButton,
 }
 struct App {
     path: PathBuf,
@@ -62,67 +68,83 @@ struct App {
     is_cut: bool,
     show_hidden: bool,
     filter_input: String,
-    file_content: String,
-    edit_content: String,
     create_directory_input: String,
     move_input: String,
-    find_input: String,
-    replace_input: String,
     selected_action: usize,
     panel_focus: PanelFocus,
     action_list_state: ListState,
-    history: Vec<PathBuf>,
-    history_index: usize,
-    top_bar_focus: TopBarFocus,
+    error_message: Option<String>,
 }
 impl App {
-    fn new(path: PathBuf) -> Self {
-        let normalized_path = Self::normalize_path(&path);
-        let files = Self::get_files(&normalized_path, true);
-        let address_input = normalized_path.to_str().unwrap().to_string();
+    fn new(path: PathBuf) -> Result<Self> {
+        let normalized_path = Self::normalize_path(&path)?;
+        let files = Self::get_files(&normalized_path, true)?;
+        let address_input = normalized_path
+            .to_str()
+            .context("Invalid path")?
+            .to_string();
         let cursor_position = address_input.len();
-        Self {
-            path: normalized_path.clone(),files,selected: 0,mode: AppMode::Normal,address_input,cursor_position,create_input: String::new(),rename_input: String::new(),clipboard: None,is_cut: false,show_hidden: true,filter_input: String::new(),file_content: String::new(),edit_content: String::new(),create_directory_input: String::new(),move_input: String::new(),find_input: String::new(),replace_input: String::new(),selected_action: 0,panel_focus: PanelFocus::Files,action_list_state: ListState::default(),history: vec![normalized_path.clone()],history_index: 0,top_bar_focus: TopBarFocus::AddressBar,}
+        Ok(Self {
+            path: normalized_path,
+            files,
+            selected: 0,
+            mode: AppMode::Normal,
+            address_input,
+            cursor_position,
+            create_input: String::new(),
+            rename_input: String::new(),
+            clipboard: None,
+            is_cut: false,
+            show_hidden: true,
+            filter_input: String::new(),
+            create_directory_input: String::new(),
+            move_input: String::new(),
+            selected_action: 0,
+            panel_focus: PanelFocus::Files,
+            action_list_state: ListState::default(),
+            error_message: None,
+        })
     }
-    fn normalize_path(path: &Path) -> PathBuf {
+    fn normalize_path(path: &Path) -> Result<PathBuf> {
         if path.starts_with("~") {
-            PathBuf::from(env::var("HOME").unwrap()).join(path.strip_prefix("~").unwrap())
+            let home = env::var("HOME").context("Failed to get HOME directory")?;
+            let mut new_path = PathBuf::new();
+            new_path.push(home);
+            new_path.push(path.strip_prefix("~").expect("Path starts with ~"));
+            Ok(new_path)
         } else {
-            path.to_path_buf()
+            Ok(path.to_path_buf())
         }
     }
-    fn get_files(path: &Path, show_hidden: bool) -> Vec<String> {
-        let mut all_entries: Vec<PathBuf> = fs::read_dir(path)
-            .unwrap()
+    fn get_files(path: &Path, show_hidden: bool) -> Result<Vec<String>> {
+        let mut all_entries: Vec<PathBuf> = fs::read_dir(path)?
             .filter_map(|res| res.ok().map(|e| e.path()))
             .collect();
         all_entries.sort_by(|a, b| {
-            let a_name = a.file_name().unwrap().to_string_lossy();
-            let b_name = b.file_name().unwrap().to_string_lossy();
-
-            let a_has_non_ascii = a_name.chars().any(|c| !c.is_ascii());
-            let b_has_non_ascii = b_name.chars().any(|c| !c.is_ascii());
-
-            match (a_has_non_ascii, b_has_non_ascii) {
-                (true, false) => std::cmp::Ordering::Less,    (false, true) => std::cmp::Ordering::Greater,    _ => match (a_name.starts_with('.'), b_name.starts_with('.')) {
-                    (true, false) => std::cmp::Ordering::Greater,        (false, true) => std::cmp::Ordering::Less,        _ => a_name.to_lowercase().cmp(&b_name.to_lowercase()),    },}
+            a.file_name()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .cmp(&b.file_name().unwrap_or_default().to_ascii_lowercase())
         });
-        let (mut hidden_dirs, mut normal_dirs, mut hidden_files, mut normal_files) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut hidden_dirs = Vec::new();
+        let mut normal_dirs = Vec::new();
+        let mut hidden_files = Vec::new();
+        let mut normal_files = Vec::new();
         for entry_path in all_entries {
             let file_name = entry_path
                 .file_name()
-                .unwrap()
+                .context("Failed to get file name")?
                 .to_string_lossy()
                 .to_string();
             if file_name == "." || file_name == ".." {
                 continue;
             }
             let is_hidden = file_name.starts_with('.');
-            if !show_hidden && is_hidden {
+            let is_dir = entry_path.is_dir();
+            if is_hidden && !show_hidden {
                 continue;
             }
-            if entry_path.is_dir() {
+            if is_dir {
                 if is_hidden {
                     hidden_dirs.push(file_name);
                 } else {
@@ -141,7 +163,7 @@ impl App {
         files.extend(normal_dirs);
         files.extend(hidden_files);
         files.extend(normal_files);
-        files
+        Ok(files)
     }
     fn select_next(&mut self) {
         if self.selected < self.files.len() - 1 {
@@ -153,68 +175,34 @@ impl App {
             self.selected -= 1;
         }
     }
-    fn open_selected(&mut self) {
+    fn open_selected(&mut self) -> Result<()> {
         let selected_file = &self.files[self.selected];
         if selected_file == ".." {
-            let parent = self.path.parent().unwrap_or(&self.path);
-            self.path = parent.to_path_buf();
-            self.files = Self::get_files(&self.path, self.show_hidden);
-            self.selected = 0;
-            return;
+            self.go_up_directory()?;
+            return Ok(())
         }
         let new_path = self.path.join(selected_file);
-        let normalized_path = Self::normalize_path(&new_path);
+        let normalized_path = Self::normalize_path(&new_path)?;
         if normalized_path.is_dir() {
-            self.update_path(normalized_path);
+            self.path = normalized_path;
+            self.files = Self::get_files(&self.path, self.show_hidden)?;
+            self.selected = 0;
         } else {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&normalized_path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+            open::that(&normalized_path)?;
         }
-    }
-    fn go_to_parent_directory(&mut self) {
-        if let Some(parent) = self.path.parent() {
-            self.update_path(parent.to_path_buf());
-        }
-    }
-    fn go_back(&mut self) {
-        if self.history_index > 0 {
-            self.history_index -= 1;
-            self.path = self.history[self.history_index].clone();
-            self.files = Self::get_files(&self.path, self.show_hidden);
-            self.selected = 0;
-        }
-    }
-    fn go_forward(&mut self) {
-        if self.history_index < self.history.len() - 1 {
-            self.history_index += 1;
-            self.path = self.history[self.history_index].clone();
-            self.files = Self::get_files(&self.path, self.show_hidden);
-            self.selected = 0;
-        }
-    }
-    fn update_path(&mut self, new_path: PathBuf) {
-        if self.history_index < self.history.len() - 1 {
-            self.history.truncate(self.history_index + 1);
-        }
-        self.path = new_path.clone();
-        self.files = Self::get_files(&self.path, self.show_hidden);
-        self.selected = 0;
-        self.history.push(new_path);
-        self.history_index = self.history.len() - 1;
+        Ok(())
     }
     fn delete_selected(&mut self) {
         self.mode = AppMode::ConfirmDelete;
     }
-    fn confirm_delete(&mut self) {
+    fn confirm_delete(&mut self) -> Result<()> {
         let selected_file = &self.files[self.selected];
         let path = self.path.join(selected_file);
-        trash::delete(path).unwrap();
-        self.files = Self::get_files(&self.path, self.show_hidden);
+        trash::delete(path)?;
+        self.files = Self::get_files(&self.path, self.show_hidden)?;
         self.selected = 0;
         self.mode = AppMode::Normal;
+        Ok(())
     }
     fn cancel_delete(&mut self) {
         self.mode = AppMode::Normal;
@@ -231,253 +219,196 @@ impl App {
         self.is_cut = true;
         self.mode = AppMode::Normal;
     }
-    fn paste(&mut self) {
+    fn paste(&mut self) -> Result<()> {
         if let Some(from) = self.clipboard.clone() {
-            let to = self.path.join(from.file_name().unwrap());
+            let to = self
+                .path
+                .join(from.file_name().context("Failed to get file name")?);
             if from.is_dir() {
-                fs::create_dir_all(&to).unwrap();
-                for entry in fs::read_dir(from.clone()).unwrap() {
-                    let entry = entry.unwrap();
+                fs::create_dir_all(&to)?;
+                for entry in fs::read_dir(from.clone())? {
+                    let entry = entry?;
                     let path = entry.path();
-                    let to = to.join(path.file_name().unwrap());
-                    fs::copy(path, to).unwrap();
+                    let to = to.join(path.file_name().context("Failed to get file name")?);
+                    fs::copy(path, to)?;
                 }
             } else {
-                fs::copy(&from, &to).unwrap();
+                fs::copy(&from, &to)?;
             }
             if self.is_cut {
                 if from.is_dir() {
-                    fs::remove_dir_all(&from).unwrap();
+                    fs::remove_dir_all(&from)?;
                 } else {
-                    fs::remove_file(&from).unwrap();
+                    fs::remove_file(&from)?;
                 }
                 self.is_cut = false;
                 self.clipboard = None;
             }
-            self.files = Self::get_files(&self.path, self.show_hidden);
+            self.files = Self::get_files(&self.path, self.show_hidden)?;
         }
+        Ok(())
     }
-    fn save_file(&mut self) {
+
+    fn open_file(&mut self) -> Result<()> {
         let selected_file = &self.files[self.selected];
         let path = self.path.join(selected_file);
         if !path.is_dir() {
-            let content =
-                fs::read_to_string(path).unwrap_or_else(|_| "Cannot read file".to_string());
-            fs::write("saved_file.txt", content).unwrap();
+            open::that(&path)?;
         }
+        Ok(())
     }
-    fn open_file(&mut self) {
-        let selected_file = &self.files[self.selected];
-        let path = self.path.join(selected_file);
-        if !path.is_dir() {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-        }
-    }
-    fn toggle_hidden_files(&mut self) {
+    fn toggle_hidden_files(&mut self) -> Result<()> {
         self.show_hidden = !self.show_hidden;
-        self.files = Self::get_files(&self.path, self.show_hidden);
+        self.files = Self::get_files(&self.path, self.show_hidden)?;
         self.selected = 0;
+        Ok(())
     }
-    fn view_file(&mut self) {
-        let selected_file = &self.files[self.selected];
-        let path = self.path.join(selected_file);
-        if !path.is_dir() {
-            self.file_content =
-                fs::read_to_string(path).unwrap_or_else(|_| "Cannot read file".to_string());
-            self.mode = AppMode::View;
-        }
-    }
-    fn edit_file(&mut self) {
-        let selected_file = &self.files[self.selected];
-        let path = self.path.join(selected_file);
-        if !path.is_dir() {
-            self.edit_content =
-                fs::read_to_string(path).unwrap_or_else(|_| "Cannot read file".to_string());
-            self.mode = AppMode::Edit;
-        }
+    fn go_up_directory(&mut self) -> Result<()> {
+        let parent = self.path.parent().context("Already at root")?;
+        self.path = parent.to_path_buf();
+        self.files = Self::get_files(&self.path, self.show_hidden)?;
+        self.selected = 0;
+        Ok(())
     }
 }
 fn ui(f: &mut Frame, app: &mut App) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
-        .split(f.size());
-    let top_bar_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(20)].as_ref())
-        .split(main_chunks[0]);
-    let mut address_bar_block = Block::default().title("Address").borders(Borders::ALL);
-    if app.panel_focus == PanelFocus::TopBarButtons && app.top_bar_focus == TopBarFocus::AddressBar
-    {
-        address_bar_block = address_bar_block.border_style(Style::default().fg(Color::Cyan));
-    }
-    let address_bar = render_address_bar(app).block(address_bar_block);
-    f.render_widget(address_bar, top_bar_chunks[0]);
-    let nav_buttons_area = top_bar_chunks[1];
-    let nav_buttons_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(33),    Constraint::Percentage(33),    Constraint::Percentage(34),]
-            .as_ref(),)
-        .split(nav_buttons_area);
-    let mut prev_button = Paragraph::new("< Prev").block(Block::default().borders(Borders::ALL));
-    let mut next_button = Paragraph::new("Next >").block(Block::default().borders(Borders::ALL));
-    let mut up_button = Paragraph::new("Up ^").block(Block::default().borders(Borders::ALL));
-    if app.panel_focus == PanelFocus::TopBarButtons {
-        match app.top_bar_focus {
-            TopBarFocus::PrevButton => {
-                prev_button = prev_button.block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),    )
-            }
-            TopBarFocus::NextButton => {
-                next_button = next_button.block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),    )
-            }
-            TopBarFocus::UpButton => {
-                up_button = up_button.block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),    )
-            }
-            _ => {}
-        }
-    }
-    f.render_widget(prev_button, nav_buttons_chunks[0]);
-    f.render_widget(next_button, nav_buttons_chunks[1]);
-    f.render_widget(up_button, nav_buttons_chunks[2]);
-    if app.mode == AppMode::Editing && app.top_bar_focus == TopBarFocus::AddressBar {
-        f.set_cursor(
-            top_bar_chunks[0].x + app.cursor_position as u16 + 1,top_bar_chunks[0].y + 1,);
+        .split(f.area());
+    let address_bar = render_address_bar(app);
+    f.render_widget(address_bar, main_chunks[0]);
+    if app.mode == AppMode::Editing {
+        f.set_cursor_position(Position::new(
+            main_chunks[0].x + app.cursor_position as u16 + 1,
+            main_chunks[0].y + 1,
+        ));
     }
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)].as_ref())
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
         .split(main_chunks[1]);
     let file_list_width = content_chunks[0].width;
-    let file_list = render_file_list(app, file_list_width);
+    let file_list = render_file_list(app, file_list_width, &app.panel_focus);
     let mut state = ListState::default();
     state.select(Some(app.selected));
     f.render_stateful_widget(file_list, content_chunks[0], &mut state);
     let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(70)].as_ref())
         .split(content_chunks[1]);
     let context_menu = render_context_menu(&app.panel_focus);
     app.action_list_state.select(Some(app.selected_action));
     f.render_stateful_widget(context_menu, right_chunks[0], &mut app.action_list_state);
-    render_preview(f, app, right_chunks[1]);
-    if let AppMode::ConfirmDelete = app.mode {
-        let area = centered_rect(60, 20, f.size());
+
+    let right_panel_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)].as_ref())
+        .split(right_chunks[1]);
+
+    render_preview(f, app, right_panel_chunks[0]);
+    render_key_hints(f, right_panel_chunks[1]);
+
+    if let Some(error_message) = &app.error_message {
+        let area = centered_rect(60, 20, f.area());
+        let p = Paragraph::new(error_message.as_str())
+            .block(Block::default().title("Error").borders(Borders::ALL))
+            .wrap(ratatui::widgets::Wrap { trim: true });
         f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default()
-                .title("Confirm Delete")
-                .borders(Borders::ALL),area,);
-        f.render_widget(
-            Paragraph::new("Are you sure you want to move to trash? (y/n)"),area,);
+        f.render_widget(p, area);
+    }
+    if let AppMode::ConfirmDelete = app.mode {
+        let block = Block::default()
+            .title("Confirm Delete")
+            .borders(Borders::ALL);
+        let area = centered_rect(60, 20, f.area());
+        f.render_widget(Clear, area);
+        f.render_widget(block, area);
+        let p = Paragraph::new("Are you sure you want to move to trash? (y/n)");
+        f.render_widget(p, area);
     }
     if let AppMode::Create = app.mode {
-        let area = centered_rect(60, 20, f.size());
+        let block = Block::default().title("Create New").borders(Borders::ALL);
+        let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default().title("Create New").borders(Borders::ALL),area,);
-        f.render_widget(Paragraph::new(app.create_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.create_input.len() as u16 + 1,area.y + 1,);
+        f.render_widget(block, area);
+        let p = Paragraph::new(app.create_input.as_str());
+        f.render_widget(p, area);
+        f.set_cursor_position(Position::new(
+            area.x + app.create_input.len() as u16 + 1,
+            area.y + 1,
+        ));
     }
     if let AppMode::Rename = app.mode {
-        let area = centered_rect(60, 20, f.size());
+        let block = Block::default().title("Rename").borders(Borders::ALL);
+        let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().title("Rename").borders(Borders::ALL), area);
-        f.render_widget(Paragraph::new(app.rename_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.rename_input.len() as u16 + 1,area.y + 1,);
+        f.render_widget(block, area);
+        let p = Paragraph::new(app.rename_input.as_str());
+        f.render_widget(p, area);
+        f.set_cursor_position(Position::new(
+            area.x + app.rename_input.len() as u16 + 1,
+            area.y + 1,
+        ));
     }
     if let AppMode::Filter = app.mode {
-        let area = centered_rect(60, 20, f.size());
+        let block = Block::default().title("Filter").borders(Borders::ALL);
+        let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().title("Filter").borders(Borders::ALL), area);
-        f.render_widget(Paragraph::new(app.filter_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.filter_input.len() as u16 + 1,area.y + 1,);
-    }
-    if let AppMode::View = app.mode {
-        let area = centered_rect(80, 80, f.size());
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default().title("View File").borders(Borders::ALL),area,);
-        f.render_widget(Paragraph::new(app.file_content.as_str()), area);
-    }
-    if let AppMode::Edit = app.mode {
-        let area = centered_rect(80, 80, f.size());
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default().title("Edit File").borders(Borders::ALL),area,);
-        f.render_widget(Paragraph::new(app.edit_content.as_str()), area);
-        f.set_cursor(
-            area.x + app.edit_content.len() as u16 + 1,area.y + 1,);
+        f.render_widget(block, area);
+        let p = Paragraph::new(app.filter_input.as_str());
+        f.render_widget(p, area);
+        f.set_cursor_position(Position::new(
+            area.x + app.filter_input.len() as u16 + 1,
+            area.y + 1,
+        ));
     }
     if let AppMode::CreateDirectory = app.mode {
-        let area = centered_rect(60, 20, f.size());
+        let block = Block::default()
+            .title("Create Directory")
+            .borders(Borders::ALL);
+        let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default()
-                .title("Create Directory")
-                .borders(Borders::ALL),area,);
-        f.render_widget(Paragraph::new(app.create_directory_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.create_directory_input.len() as u16 + 1,area.y + 1,);
+        f.render_widget(block, area);
+        let p = Paragraph::new(app.create_directory_input.as_str());
+        f.render_widget(p, area);
+        f.set_cursor_position(Position::new(
+            area.x + app.create_directory_input.len() as u16 + 1,
+            area.y + 1,
+        ));
     }
     if let AppMode::Move = app.mode {
-        let area = centered_rect(60, 20, f.size());
+        let block = Block::default().title("Move").borders(Borders::ALL);
+        let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().title("Move").borders(Borders::ALL), area);
-        f.render_widget(Paragraph::new(app.move_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.move_input.len() as u16 + 1,area.y + 1,);
-    }
-    if let AppMode::Find = app.mode {
-        let area = centered_rect(60, 20, f.size());
-        f.render_widget(Clear, area);
-        f.render_widget(Block::default().title("Find").borders(Borders::ALL), area);
-        f.render_widget(Paragraph::new(app.find_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.find_input.len() as u16 + 1,area.y + 1,);
-    }
-    if let AppMode::Replace = app.mode {
-        let area = centered_rect(60, 20, f.size());
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Block::default().title("Replace").borders(Borders::ALL),area,);
-        f.render_widget(Paragraph::new(app.replace_input.as_str()), area);
-        f.set_cursor(
-            area.x + app.replace_input.len() as u16 + 1,area.y + 1,);
-    }
+        f.render_widget(block, area);
+        let p = Paragraph::new(app.move_input.as_str());
+        f.render_widget(p, area);
+        f.set_cursor_position(Position::new(
+            area.x + app.move_input.len() as u16 + 1,
+            area.y + 1,
+        ));
 }
-fn truncate_filename(name: &str, max_width: usize) -> String {
-    let mut current_width = 0;
-    let mut truncated_string = String::new();
-    let mut chars = name.chars().peekable();
-    while let Some(c) = chars.next() {
-        let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if current_width + char_width > max_width {
-            truncated_string.push_str("...");
-            break;
-        }
-        truncated_string.push(c);
-        current_width += char_width;
-    }
-    truncated_string
 }
+fn render_key_hints(f: &mut Frame, area: Rect) {
+    let mut spans = Vec::new();
+    for (vim_key, arrow_key, _description) in VIM_KEY_HINTS.iter() { // Ignore description
+        spans.push(Span::styled(format!("{vim_key}"), Style::default().fg(Color::Yellow)));
+        spans.push(Span::raw("/"));
+        spans.push(Span::styled(format!("{arrow_key:<10}"), Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw("  ")); // Add some spacing between hints
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans))
+        .block(
+            Block::default()
+                .title("Key Hints")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Reset)),
+        )
+        .alignment(Alignment::Center); // Center the text for better appearance
+    f.render_widget(paragraph, area);
+}
+
 fn render_address_bar<'a>(app: &'a App) -> Paragraph<'a> {
     let path_str = if app.mode == AppMode::Editing {
         app.address_input.as_str()
@@ -486,143 +417,166 @@ fn render_address_bar<'a>(app: &'a App) -> Paragraph<'a> {
     };
     Paragraph::new(path_str).block(Block::default().title("Address").borders(Borders::ALL))
 }
-fn render_file_list<'a>(app: &'a App, max_width: u16) -> List<'a> {
+fn render_file_list<'a>(app: &'a App, max_width: u16, panel_focus: &PanelFocus) -> List<'a> {
     let items: Vec<ListItem> = app
         .files
         .iter()
         .map(|i| {
             let path = app.path.join(i);
             let is_dir = path.is_dir();
-            let (glyph, color) = if is_dir {
-                (md::MD_FOLDER_OPEN, Color::Green)
+            let color = if is_dir {
+                Color::Rgb(0, 200, 128) // Dark Green
             } else {
-                (md::MD_FILE, Color::Blue)
+                Color::Blue
             };
-            let display_name = truncate_filename(i, max_width as usize - (glyph.trim().len() + 2));
+            let style = Style::default().fg(color);
+
+            let glyph = if is_dir {
+                md::MD_FOLDER_OPEN
+            } else {
+                md::MD_FILE
+            };
+
+            let size_width = 10;
+            let name_width = (max_width as usize).saturating_sub(size_width + 4);
+
+            let display_name_str = if i.chars().count() > name_width {
+                i.chars().take(name_width - 3).collect::<String>() + "..."
+            } else {
+                i.clone()
+            };
+
+            let name_part_width =
+                glyph.trim().chars().count() + 2 + display_name_str.chars().count();
+            let padding_width = name_width.saturating_sub(name_part_width);
+            let padding = " ".repeat(padding_width);
+
             let mut spans = vec![
-                Span::styled(glyph.trim(), Style::default().fg(color)),    Span::raw(format!("  {}", display_name.trim())),];
+                Span::styled(glyph.trim(), style),
+                Span::styled(format!("  {display_name_str}"), style),
+                Span::raw(padding),
+            ];
+
             if !is_dir {
                 if let Ok(metadata) = fs::metadata(&path) {
-                    let formatted_size = format_size(metadata.len());
-                    let padding = (max_width as usize).saturating_sub(
-                        glyph.trim().len()
-                            + 2
-                            + display_name.trim().len()
-                            + formatted_size.len()
-                            + 4,        );
-                    spans.extend_from_slice(&[
-                        Span::raw(" ".repeat(padding)),            Span::raw(formatted_size),        ]);
+                    let size = metadata.len();
+                    let formatted_size = format_size(size);
+                    let padded_size = format!("{:>width$}", formatted_size, width = size_width);
+                    spans.push(Span::raw(padded_size));
                 }
             }
+
             ListItem::new(Line::from(spans))
         })
         .collect();
-    List::new(items)
-        .block(Block::default().title("Files").borders(Borders::ALL))
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(50, 50, 50))
-                .add_modifier(Modifier::BOLD),)
-        .highlight_symbol("> ")
+    let mut list = List::new(items).block(Block::default().title("Files").borders(Borders::ALL));
+    list = list.highlight_style(Style::default().bg(Color::Rgb(70, 70, 70))); // A subtle background for selected item when not focused
+
+    if let PanelFocus::Files = panel_focus {
+        list = list
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(70, 70, 70))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+    }
+    list
 }
 fn render_context_menu(panel_focus: &PanelFocus) -> List<'_> {
-    const ACTIONS: &[(&str, &str)] = &[
-        ("Cut", "x"),("Copy", "c"),("Paste", "p"),("Delete", "d"),("Rename", "r"),("Create", "n"),("Create Directory", "+"),("Move", "m"),("View", "v"),("Edit", "e"),("Find", "Ctrl+f"),("Replace", "Ctrl+r"),("Toggle Hidden", "h"),("Quit", "q"),
-    ];
-    let mut list = List::new(
-        ACTIONS
-            .iter()
-            .map(|(action, shortcut)| ListItem::new(format!("{} ({})", action, shortcut)))
-            .collect::<Vec<ListItem>>(),
-    )
-    .block(Block::default().title("Actions").borders(Borders::ALL));
+    let items: Vec<ListItem> = ACTIONS
+        .iter()
+        .map(|(action, shortcut)| ListItem::new(format!("{} ({})", action, shortcut)))
+        .collect();
+    let mut list = List::new(items)
+        .block(
+            Block::default()
+                .title("Actions")
+                .borders(Borders::ALL),
+        );
     if let PanelFocus::Actions = panel_focus {
         list = list
             .highlight_style(
                 Style::default()
                     .bg(Color::Rgb(50, 50, 50))
-                    .add_modifier(Modifier::BOLD),)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("> ");
     }
     list
 }
-#[allow(unused_assignments)]
 fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Clear, area);
-    let selected_file = &app.files[app.selected];
-    let path = app.path.join(selected_file);
-    if selected_file == ".wget-hsts" {
-        f.render_widget(
-            Paragraph::new("Preview not available for .wget-hsts files.")
-                .block(Block::default().title("Preview").borders(Borders::ALL)),area,);
+    let path = if let Some(selected_file) = app.files.get(app.selected) {
+        app.path.join(selected_file)
+    } else {
         return;
+    };
+
+    // Explicitly block .wget-hsts file
+    if path.file_name().map_or(false, |name| name == ".wget-hsts") {
+        let p = Paragraph::new("'.wget-hsts' file is blocked from preview.")
+            .block(Block::default().title("Preview").borders(Borders::ALL));
+        f.render_widget(p, area);
+        return; // Exit the function early
     }
+
+    // Check file size for preview
     if let Ok(metadata) = fs::metadata(&path) {
         const MAX_PREVIEW_SIZE_MB: u64 = 300;
-        if metadata.len() > MAX_PREVIEW_SIZE_MB * 1024 * 1024 {
-            f.render_widget(
-                Paragraph::new(format!(
-                    "File is too large for preview ({}) Max size is {} MB.",        format_size(metadata.len()),        MAX_PREVIEW_SIZE_MB
-                ))
-                .block(Block::default().title("Preview").borders(Borders::ALL)),    area,);
-            return;
+        const MAX_PREVIEW_SIZE_BYTES: u64 = MAX_PREVIEW_SIZE_MB * 1024 * 1024; // 300 MB in bytes
+        if metadata.len() > MAX_PREVIEW_SIZE_BYTES {
+            let p = Paragraph::new(format!(
+                "File is too large for preview ({}) Max size is {} MB.",
+                format_size(metadata.len()),
+                MAX_PREVIEW_SIZE_MB
+            ))
+            .block(Block::default().title("Preview").borders(Borders::ALL));
+            f.render_widget(p, area);
+            return; // Exit the function early
         }
     }
-    if is_media(&path) {
-        if is_actual_image(&path) {
-            let preview_path_option = Some(path.clone());
-
-            if let Some(p_path) = &preview_path_option {
-                match fs::read(p_path) {
-                    Ok(buffer) => {
-                        match image::load_from_memory(&buffer) {
-                            Ok(img) => {
-                                let config = viuer::Config {
-                                    x: area.x + 2,
-                                    y: (area.y + 1) as i16,
-                                    width: Some(area.width.saturating_sub(4) as u32),
-                                    height: Some(area.height.saturating_sub(2) as u32),
-                                    use_kitty: true,
-                                    truecolor: true,
-                                    ..Default::default()
-                                };
-                                if viuer::print(&img, &config).is_err() {
-                                    let p = Paragraph::new("Image printing failed.")
-                                        .block(Block::default().title("Preview").borders(Borders::ALL));
-                                    f.render_widget(p, area);
-                                }
-                            }
-                            Err(_) => {
-                                let p = Paragraph::new("Could not decode image.")
-                                    .block(Block::default().title("Preview").borders(Borders::ALL));
-                                f.render_widget(p, area);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        let p = Paragraph::new("Could not read image file.")
-                            .block(Block::default().title("Preview").borders(Borders::ALL));
-                        f.render_widget(p, area);
-                    }
-                }
-            }
+    if is_image(&path) {
+        if let Ok(_img) = image::open(&path) {
+            let inner_area = area.inner(Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
+            let config = viuer::Config {
+                x: inner_area.x,
+                y: inner_area.y as i16,
+                width: Some(inner_area.width as u32),
+                height: Some(inner_area.height as u32),
+                ..Default::default()
+            };
+            viuer::print_from_file(path, &config).expect("Image printing failed.");
+            // Draw the block and borders after the image to make them visible
+            let block = Block::default().title("Preview").borders(Borders::ALL).style(Style::default().bg(Color::Reset));
+            f.render_widget(block, area);
         } else {
-            f.render_widget(
-                Paragraph::new("Video previews are currently disabled.")
-                    .block(Block::default().title("Preview").borders(Borders::ALL)),    area,);
+            let p = Paragraph::new("Could not load image")
+                .block(Block::default().title("Preview").borders(Borders::ALL));
+            f.render_widget(p, area);
         }
+    } else if is_likely_binary(&path) {
+        let p = Paragraph::new("Binary file, no preview available.")
+            .block(Block::default().title("Preview").borders(Borders::ALL));
+        f.render_widget(p, area);
     } else {
+        let block = Block::default().style(Style::default().bg(Color::Reset));
+        f.render_widget(block, area);
+
         let content = if path.is_dir() {
             "Directory".to_string()
         } else {
-            fs::read_to_string(path).unwrap_or_else(|_| "Cannot read file".to_string())
+            fs::read_to_string(path).unwrap_or_else(|err| format!("Cannot read file: {}", err))
         };
         let max_width = area.width.saturating_sub(2) as usize;
         let truncated_content: String = content
             .lines()
             .map(|line| {
                 if line.len() > max_width {
-                    format!("{}", &line[0..max_width.saturating_sub(3)])
+                    format!("{}\"...", &line[0..max_width.saturating_sub(3)])
                 } else {
                     line.to_string()
                 }
@@ -635,35 +589,37 @@ fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(p, area);
     }
 }
-fn is_actual_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |ext| {
-            matches!(
-                ext.to_lowercase().as_str(),    "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "tiff" | "webp"
-            )
-        })
+fn is_image(path: &Path) -> bool {
+    let extension = path.extension().and_then(|s| s.to_str());
+    if let Some(ext) = extension {
+        matches!(
+            ext.to_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "tiff" | "webp"
+        )
+    } else {
+        false
+    }
 }
-fn is_media(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |ext| {
-            matches!(
-                ext.to_lowercase().as_str(),    "png"
-                    | "jpg"
-                    | "jpeg"
-                    | "gif"
-                    | "bmp"
-                    | "ico"
-                    | "tiff"
-                    | "webp"
-                    | "mp4"
-                    | "mkv"
-                    | "avi"
-                    | "mov"
-                    | "webm"
-            )
-        })
+
+fn is_likely_binary(path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut buffer = [0; 1024];
+    let n = match file.read(&mut buffer) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    for &byte in &buffer[..n] {
+        if byte == 0 {
+            return true;
+        }
+    }
+    false
 }
 fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
@@ -684,368 +640,355 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage((100 - percent_y) / 2),    Constraint::Percentage(percent_y),    Constraint::Percentage((100 - percent_y) / 2),]
-            .as_ref(),)
+                Constraint::Percentage((100 - percent_y) / 2),
+                Constraint::Percentage(percent_y),
+                Constraint::Percentage((100 - percent_y) / 2),
+            ]
+            .as_ref(),
+        )
         .split(r);
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints(
             [
-                Constraint::Percentage((100 - percent_x) / 2),    Constraint::Percentage(percent_x),    Constraint::Percentage((100 - percent_x) / 2),]
-            .as_ref(),)
+                Constraint::Percentage((100 - percent_x) / 2),
+                Constraint::Percentage(percent_x),
+                Constraint::Percentage((100 - percent_x) / 2),
+            ]
+            .as_ref(),
+        )
         .split(popup_layout[1])[1]
 }
-fn get_interactive_areas(f: &Frame) -> (Rect, Rect, Rect, Rect, Rect, Rect) {
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
-        .split(f.size());
-    let top_bar_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(20)].as_ref())
-        .split(main_chunks[0]);
-    let nav_buttons_area = top_bar_chunks[1];
-    let nav_buttons_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(33),    Constraint::Percentage(33),    Constraint::Percentage(34),]
-            .as_ref(),)
-        .split(nav_buttons_area);
-    let content_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)].as_ref())
-        .split(main_chunks[1]);
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
-        .split(content_chunks[1]);
-    (
-        top_bar_chunks[0],nav_buttons_chunks[0],nav_buttons_chunks[1],nav_buttons_chunks[2],content_chunks[0],right_chunks[0],
-    )
-}
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
-        let timeout = std::time::Duration::from_millis(250);
-        if crossterm::event::poll(timeout)? {
-            let (
-                address_bar_rect,    prev_button_rect,    next_button_rect,    up_button_rect,    file_list_rect,    action_list_rect,) = get_interactive_areas(&terminal.get_frame());
+
+        if crossterm::event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                match app.mode {
-                    AppMode::Normal => match app.panel_focus {
-                        PanelFocus::Files => match key.code {
-                            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
-                                app.go_back()
-                            }
-                            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                                app.go_forward()
-                            }
-                            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                                app.go_to_parent_directory()
-                            }
-                            KeyCode::Char('q') => return Ok(()),                KeyCode::Down => app.select_next(),                KeyCode::Up => app.select_previous(),                KeyCode::Enter => app.open_selected(),                KeyCode::Char('d') => app.delete_selected(),                KeyCode::Char('/') => {
-                                app.mode = AppMode::Editing;
-                                app.panel_focus = PanelFocus::TopBarButtons;
-                                app.top_bar_focus = TopBarFocus::AddressBar;
-                            }
-                            KeyCode::Char('n') => app.mode = AppMode::Create,                KeyCode::Char('c') => app.copy_selected(),                KeyCode::Char('x') => app.cut_selected(),                KeyCode::Char('p') => app.paste(),                KeyCode::Char('s') => app.save_file(),                KeyCode::Char('o') => app.open_file(),                KeyCode::Char('h') => app.toggle_hidden_files(),                KeyCode::Char('v') => app.view_file(),                KeyCode::Char('e') => app.edit_file(),                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.mode = AppMode::Find
-                            }
-                            KeyCode::Char('f') => app.mode = AppMode::Filter,                KeyCode::Char('r') => {
-                                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                    app.mode = AppMode::Replace;
-                                } else {
+                // Handle universal quit key
+                if key.code == KeyCode::Char('q') {
+                    return Ok(());
+                }
+
+                if let Some(_) = &app.error_message {
+                    if let KeyCode::Enter | KeyCode::Esc = key.code {
+                        app.error_message = None;
+                    }
+                    continue;
+                }
+                let result = match app.mode {
+                    AppMode::Normal => {
+                        match app.panel_focus {
+                            PanelFocus::Files => match key.code {
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.select_next();
+                                    Ok(())
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.select_previous();
+                                    Ok(())
+                                }
+                                KeyCode::Enter => app.open_selected(),
+                                KeyCode::Char('u') => app.go_up_directory(),
+                                KeyCode::Char('d') => {
+                                    app.delete_selected();
+                                    Ok(())
+                                }
+                                KeyCode::Char('/') => {
+                                    app.mode = AppMode::Editing;
+                                    Ok(())
+                                }
+                                KeyCode::Char('n') => {
+                                    app.mode = AppMode::Create;
+                                    Ok(())
+                                }
+                                KeyCode::Char('c') => {
+                                    app.copy_selected();
+                                    Ok(())
+                                }
+                                KeyCode::Char('x') => {
+                                    app.cut_selected();
+                                    Ok(())
+                                }
+                                KeyCode::Char('p') => app.paste(),
+
+                                KeyCode::Char('o') => app.open_file(),
+                                KeyCode::Char('H')
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
+                                    app.toggle_hidden_files()
+                                }
+                                KeyCode::Char('f') => {
+                                    app.mode = AppMode::Filter;
+                                    Ok(())
+                                }
+                                KeyCode::Char('r') => {
                                     app.mode = AppMode::Rename;
+                                    Ok(())
                                 }
-                            }
-                            KeyCode::Char('+') => app.mode = AppMode::CreateDirectory,                KeyCode::Delete => app.delete_selected(),                KeyCode::Char('m') => app.mode = AppMode::Move,                KeyCode::Right => app.panel_focus = PanelFocus::Actions,                KeyCode::Tab => app.panel_focus = PanelFocus::TopBarButtons,                KeyCode::Left => {}
-                            KeyCode::Backspace => app.go_to_parent_directory(),                _ => {}
-                        },            PanelFocus::Actions => match key.code {
-                            KeyCode::Up => {
-                                if app.selected_action > 0 {
-                                    app.selected_action -= 1;
-                                    app.action_list_state.select(Some(app.selected_action));
+                                KeyCode::Char('+') => {
+                                    app.mode = AppMode::CreateDirectory;
+                                    Ok(())
                                 }
-                            }
-                            KeyCode::Down => {
-                                if app.selected_action < 13 {
-                                    app.selected_action += 1;
-                                    app.action_list_state.select(Some(app.selected_action));
+                                KeyCode::Delete => {
+                                    app.delete_selected();
+                                    Ok(())
                                 }
-                            }
-                            KeyCode::Left => app.panel_focus = PanelFocus::Files,                KeyCode::Enter => {
-                                match app.selected_action {
-                                    0 => app.cut_selected(),                        1 => app.copy_selected(),                        2 => app.paste(),                        3 => app.delete_selected(),                        4 => app.mode = AppMode::Rename,                        5 => app.mode = AppMode::Create,                        6 => app.mode = AppMode::CreateDirectory,                        7 => app.mode = AppMode::Move,                        8 => app.view_file(),                        9 => app.edit_file(),                        10 => app.mode = AppMode::Find,                        11 => app.mode = AppMode::Replace,                        12 => app.toggle_hidden_files(),                        13 => return Ok(()),                        _ => {}
+                                KeyCode::Char('m') => {
+                                    app.mode = AppMode::Move;
+                                    Ok(())
                                 }
-                                app.mode = AppMode::Normal;
-                                app.panel_focus = PanelFocus::Files;
-                            }
-                            KeyCode::Esc => {
-                                app.mode = AppMode::Normal;
-                                app.panel_focus = PanelFocus::Files;
-                            }
-                            _ => {}
-                        },            PanelFocus::TopBarButtons => match key.code {
-                            KeyCode::Left => {
-                                app.top_bar_focus = match app.top_bar_focus {
-                                    TopBarFocus::AddressBar => TopBarFocus::UpButton,                        TopBarFocus::PrevButton => TopBarFocus::AddressBar,                        TopBarFocus::NextButton => TopBarFocus::PrevButton,                        TopBarFocus::UpButton => TopBarFocus::NextButton,                    };
-                            }
-                            KeyCode::Right => {
-                                app.top_bar_focus = match app.top_bar_focus {
-                                    TopBarFocus::AddressBar => TopBarFocus::PrevButton,                        TopBarFocus::PrevButton => TopBarFocus::NextButton,                        TopBarFocus::NextButton => TopBarFocus::UpButton,                        TopBarFocus::UpButton => TopBarFocus::AddressBar,                    };
-                            }
-                            KeyCode::Enter => {
-                                match app.top_bar_focus {
-                                    TopBarFocus::AddressBar => app.mode = AppMode::Editing,                        TopBarFocus::PrevButton => app.go_back(),                        TopBarFocus::NextButton => app.go_forward(),                        TopBarFocus::UpButton => app.go_to_parent_directory(),                    }
-                                if app.top_bar_focus != TopBarFocus::AddressBar {
-                                    app.panel_focus = PanelFocus::Files;
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    app.panel_focus = PanelFocus::Actions;
+                                    Ok(())
                                 }
+                                _ => Ok(()), // Ignore other keys
+                            },
+                            PanelFocus::Actions => {
+                                match key.code {
+                                    KeyCode::Up => {
+                                        if app.selected_action > 0 {
+                                            app.selected_action -= 1;
+                                            app.action_list_state
+                                                .select(Some(app.selected_action));
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        if app.selected_action < ACTIONS.len() - 1 {
+                                            app.selected_action += 1;
+                                            app.action_list_state
+                                                .select(Some(app.selected_action));
+                                        }
+                                    }
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        app.panel_focus = PanelFocus::Files
+                                    }
+                                    KeyCode::Enter => {
+                                        match app.selected_action {
+                                            0 => app.cut_selected(),
+                                            1 => app.copy_selected(),
+                                            2 => {
+                                                if let Err(e) = app.paste() {
+                                                    app.error_message = Some(e.to_string())
+                                                }
+                                            }
+                                            3 => app.delete_selected(),
+                                            4 => app.mode = AppMode::Rename,
+                                            5 => app.mode = AppMode::Create,
+                                            6 => app.mode = AppMode::CreateDirectory,
+                                            7 => app.mode = AppMode::Move,
+                                            8 => {
+                                                if let Err(e) = app.open_file() {
+                                                    app.error_message = Some(e.to_string())
+                                                }
+                                            }
+                                            9 => {
+                                                if let Err(e) = app.toggle_hidden_files() {
+                                                    app.error_message = Some(e.to_string())
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        app.mode = AppMode::Normal; // Return to normal mode after action
+                                        app.panel_focus = PanelFocus::Files; // Return focus to files panel
+                                    }
+                                    KeyCode::Esc => {
+                                        app.mode = AppMode::Normal;
+                                        app.panel_focus = PanelFocus::Files; // Return focus to files panel
+                                    }
+                                    _ => {} // Ignore other keys
+                                }
+                                Ok(())
                             }
-                            KeyCode::Esc | KeyCode::Down => {
-                                app.panel_focus = PanelFocus::Files;
-                                app.mode = AppMode::Normal;
-                            }
-                            _ => {}
-                        },        },        AppMode::ConfirmDelete => match key.code {
-                        KeyCode::Char('y') => app.confirm_delete(),            KeyCode::Char('n') => app.cancel_delete(),            _ => {}
-                    },        AppMode::Editing => match key.code {
+                        }
+                    }
+                    AppMode::ConfirmDelete => match key.code {
+                        KeyCode::Char('y') => app.confirm_delete(),
+                        KeyCode::Char('n') => {
+                            app.cancel_delete();
+                            Ok(())
+                        }
+                        _ => Ok(()), // Ignore other keys
+                    },
+                    AppMode::Editing => match key.code {
                         KeyCode::Char(c) => {
                             app.address_input.insert(app.cursor_position, c);
                             app.cursor_position += 1;
+                            Ok(())
                         }
                         KeyCode::Backspace => {
                             if app.cursor_position > 0 {
                                 app.cursor_position -= 1;
                                 app.address_input.remove(app.cursor_position);
                             }
+                            Ok(())
                         }
                         KeyCode::Enter => {
                             let new_path = PathBuf::from(&app.address_input);
                             if new_path.is_dir() {
-                                app.update_path(new_path);
+                                app.path = new_path;
+                                app.files = App::get_files(&app.path, app.show_hidden)?;
+                                app.selected = 0;
                             }
                             app.mode = AppMode::Normal;
-                            app.panel_focus = PanelFocus::Files;
+                            Ok(())
                         }
                         KeyCode::Esc => {
                             app.mode = AppMode::Normal;
-                            app.panel_focus = PanelFocus::Files;
+                            Ok(())
                         }
-                        _ => {}
-                    },        AppMode::Create => match key.code {
+                        _ => Ok(()), // Ignore other keys
+                    },
+                    AppMode::Create => match key.code {
                         KeyCode::Char(c) => {
                             app.create_input.push(c);
+                            Ok(())
                         }
                         KeyCode::Backspace => {
                             app.create_input.pop();
+                            Ok(())
                         }
                         KeyCode::Enter => {
                             let new_path = app.path.join(&app.create_input);
                             if new_path.ends_with("/") {
-                                fs::create_dir_all(new_path).unwrap();
+                                fs::create_dir_all(new_path)?;
                             } else {
-                                fs::File::create(new_path).unwrap();
+                                fs::File::create(new_path)?;
                             }
-                            app.files = App::get_files(&app.path, app.show_hidden);
+                            app.files = App::get_files(&app.path, app.show_hidden)?;
                             app.create_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
                         KeyCode::Esc => {
                             app.create_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
-                        _ => {}
-                    },        AppMode::Rename => match key.code {
+                        _ => Ok(()), // Ignore other keys
+                    },
+                    AppMode::Rename => match key.code {
                         KeyCode::Char(c) => {
                             app.rename_input.push(c);
+                            Ok(())
                         }
                         KeyCode::Backspace => {
                             app.rename_input.pop();
+                            Ok(())
                         }
                         KeyCode::Enter => {
                             let old_path = app.path.join(&app.files[app.selected]);
                             let new_path = app.path.join(&app.rename_input);
-                            fs::rename(old_path, new_path).unwrap();
-                            app.files = App::get_files(&app.path, app.show_hidden);
+                            fs::rename(old_path, new_path)?;
+                            app.files = App::get_files(&app.path, app.show_hidden)?;
                             app.rename_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
                         KeyCode::Esc => {
                             app.rename_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
-                        _ => {}
-                    },        AppMode::Filter => match key.code {
+                        _ => Ok(()), // Ignore other keys
+                    },
+                    AppMode::Filter => match key.code {
                         KeyCode::Char(c) => {
                             app.filter_input.push(c);
+                            Ok(())
                         }
                         KeyCode::Backspace => {
                             app.filter_input.pop();
+                            Ok(())
                         }
                         KeyCode::Enter => {
-                            app.files = App::get_files(&app.path, app.show_hidden);
+                            app.files = App::get_files(&app.path, app.show_hidden)?;
                             app.files.retain(|f| f.contains(&app.filter_input));
                             app.selected = 0;
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
                         KeyCode::Esc => {
                             app.filter_input.clear();
-                            app.files = App::get_files(&app.path, app.show_hidden);
+                            app.files = App::get_files(&app.path, app.show_hidden)?;
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
-                        _ => {}
-                    },        AppMode::View => match key.code {
-                        KeyCode::Esc => app.mode = AppMode::Normal,            _ => {}
-                    },        AppMode::Edit => match key.code {
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let selected_file = &app.files[app.selected];
-                            let path = app.path.join(selected_file);
-                            fs::write(path, &app.edit_content).unwrap();
-                            app.edit_content.clear();
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Char(c) => {
-                            app.edit_content.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            app.edit_content.pop();
-                        }
-                        KeyCode::Enter => {
-                            let selected_file = &app.files[app.selected];
-                            let path = app.path.join(selected_file);
-                            fs::write(path, &app.edit_content).unwrap();
-                            app.edit_content.clear();
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Esc => {
-                            app.edit_content.clear();
-                            app.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    },        AppMode::CreateDirectory => match key.code {
+                        _ => Ok(()), // Ignore other keys
+                    },
+                    AppMode::CreateDirectory => match key.code {
                         KeyCode::Char(c) => {
                             app.create_directory_input.push(c);
+                            Ok(())
                         }
                         KeyCode::Backspace => {
                             app.create_directory_input.pop();
+                            Ok(())
                         }
                         KeyCode::Enter => {
                             let new_path = app.path.join(&app.create_directory_input);
-                            fs::create_dir_all(new_path).unwrap();
-                            app.files = App::get_files(&app.path, app.show_hidden);
+                            fs::create_dir_all(new_path)?;
+                            app.files = App::get_files(&app.path, app.show_hidden)?;
                             app.create_directory_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
                         KeyCode::Esc => {
                             app.create_directory_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
-                        _ => {}
-                    },        AppMode::Move => match key.code {
+                        _ => Ok(()), // Ignore other keys
+                    },
+                    AppMode::Move => match key.code {
                         KeyCode::Char(c) => {
                             app.move_input.push(c);
+                            Ok(())
                         }
                         KeyCode::Backspace => {
                             app.move_input.pop();
+                            Ok(())
                         }
                         KeyCode::Enter => {
                             let old_path = app.path.join(&app.files[app.selected]);
                             let new_path = PathBuf::from(&app.move_input);
-                            fs::rename(old_path, new_path).unwrap();
-                            app.files = App::get_files(&app.path, app.show_hidden);
+                            fs::rename(old_path, new_path)?;
+                            app.files = App::get_files(&app.path, app.show_hidden)?;
                             app.move_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
                         KeyCode::Esc => {
                             app.move_input.clear();
                             app.mode = AppMode::Normal;
+                            Ok(())
                         }
-                        _ => {}
-                    },        AppMode::Find => match key.code {
-                        KeyCode::Char(c) => {
-                            app.find_input.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            app.find_input.pop();
-                        }
-                        KeyCode::Enter => {
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Esc => {
-                            app.find_input.clear();
-                            app.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    },        AppMode::Replace => match key.code {
-                        KeyCode::Char(c) => {
-                            app.replace_input.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            app.replace_input.pop();
-                        }
-                        KeyCode::Enter => {
-                            app.mode = AppMode::Normal;
-                        }
-                        KeyCode::Esc => {
-                            app.replace_input.clear();
-                            app.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    },    }
-            } else if let Event::Mouse(mouse_event) = event::read()? {
-                if let event::MouseEventKind::Down(button) = mouse_event.kind {
-                    if button == event::MouseButton::Left {
-                        let (x, y) = (mouse_event.column, mouse_event.row);
-                        if address_bar_rect.contains(ratatui::layout::Position::new(x, y)) {
-                            app.panel_focus = PanelFocus::TopBarButtons;
-                            app.top_bar_focus = TopBarFocus::AddressBar;
-                            app.mode = AppMode::Editing;
-                            app.cursor_position =
-                                (x - address_bar_rect.x).saturating_sub(1) as usize;
-                        } else if prev_button_rect.contains(ratatui::layout::Position::new(x, y)) {
-                            app.go_back();
-                            app.panel_focus = PanelFocus::Files;
-                            app.mode = AppMode::Normal;
-                        } else if next_button_rect.contains(ratatui::layout::Position::new(x, y)) {
-                            app.go_forward();
-                            app.panel_focus = PanelFocus::Files;
-                            app.mode = AppMode::Normal;
-                        } else if up_button_rect.contains(ratatui::layout::Position::new(x, y)) {
-                            app.go_to_parent_directory();
-                            app.panel_focus = PanelFocus::Files;
-                            app.mode = AppMode::Normal;
-                        } else if file_list_rect.contains(ratatui::layout::Position::new(x, y)) {
-                            app.panel_focus = PanelFocus::Files;
-                            let clicked_index = (y - file_list_rect.y) as usize;
-                            if clicked_index < app.files.len() {
-                                app.selected = clicked_index;
-                            }
-                        } else if action_list_rect.contains(ratatui::layout::Position::new(x, y)) {
-                            app.panel_focus = PanelFocus::Actions;
-                            let clicked_index = (y - action_list_rect.y) as usize;
-                            if clicked_index < 14 {
-                                app.selected_action = clicked_index;
-                            }
-                        }
-                    }
+                        _ => Ok(()),
+                    },
+                };
+                if let Err(e) = result {
+                    app.error_message = Some(e.to_string());
                 }
             }
         }
     }
 }
-
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     enable_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    execute!(
-        terminal.backend_mut(),EnterAlternateScreen,EnableMouseCapture
-    )?;
-    let mut app = App::new(env::current_dir().unwrap());
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut app = App::new(env::current_dir()?)?;
     let res = run_app(&mut terminal, &mut app);
     disable_raw_mode()?;
     execute!(
-        terminal.backend_mut(),LeaveAlternateScreen,DisableMouseCapture
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
     )?;
     terminal.show_cursor()?;
     if let Err(err) = res {
@@ -1053,4 +996,3 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
-
