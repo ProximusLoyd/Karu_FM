@@ -14,6 +14,7 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    time::Instant,
 };
 use trash;
 use viuer;
@@ -32,11 +33,11 @@ const ACTIONS: &[(&str, &str)] = &[
     ("Toggle Hidden", "Shift+H"),
 ];
 const VIM_KEY_HINTS: &[(&str, &str, &str)] = &[
-    ("j", "Down Arrow", "Move down in file list"),
-    ("k", "Up Arrow", "Move up in file list"),
-    ("h", "Left Arrow", "Unfocus actions panel / Go up directory"),
-    ("l", "Right Arrow", "Focus actions panel / Open selected"),
-    ("q", "Quit", "Quit the application"),
+    ("J", "Down Arrow", "Move down in file list"),
+    ("K", "Up Arrow", "Move up in file list"),
+    ("H", "Left Arrow", "Unfocus actions panel / Go up directory"),
+    ("L", "Right Arrow", "Focus actions panel / Open selected"),
+    ("Q", "Quit", "Quit the application"),
 ];
 
 #[derive(PartialEq)]
@@ -74,6 +75,8 @@ struct App {
     panel_focus: PanelFocus,
     action_list_state: ListState,
     error_message: Option<String>,
+    delayed_preview_path: Option<PathBuf>,
+    last_highlight_time: Instant,
 }
 impl App {
     fn new(path: PathBuf) -> Result<Self> {
@@ -103,6 +106,8 @@ impl App {
             panel_focus: PanelFocus::Files,
             action_list_state: ListState::default(),
             error_message: None,
+            delayed_preview_path: None,
+            last_highlight_time: Instant::now(),
         })
     }
     fn normalize_path(path: &Path) -> Result<PathBuf> {
@@ -305,7 +310,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Min(0), Constraint::Length(3)].as_ref())
         .split(right_chunks[1]);
 
-    render_preview(f, app, right_panel_chunks[0]);
+    let current_selected_path = if let Some(selected_file) = app.files.get(app.selected) {
+        Some(app.path.join(selected_file))
+    } else {
+        None
+    };
+    render_preview(f, right_panel_chunks[0], current_selected_path, app.last_highlight_time);
     render_key_hints(f, right_panel_chunks[1]);
 
     if let Some(error_message) = &app.error_message {
@@ -505,10 +515,20 @@ fn render_context_menu(panel_focus: &PanelFocus) -> List<'_> {
     }
     list
 }
-fn render_preview(f: &mut Frame, app: &mut App, area: Rect) {
+fn render_preview(f: &mut Frame, area: Rect, path_to_preview: Option<PathBuf>, last_highlight_time: Instant) {
     f.render_widget(Clear, area);
-    let path = if let Some(selected_file) = app.files.get(app.selected) {
-        app.path.join(selected_file)
+
+    let current_time = Instant::now();
+    let elapsed_time = current_time.duration_since(last_highlight_time);
+    const PREVIEW_DELAY_MS: u64 = 100;
+
+    let path = if elapsed_time.as_millis() < PREVIEW_DELAY_MS as u128 {
+        let p = Paragraph::new("Loading preview...")
+            .block(Block::default().title("Preview").borders(Borders::ALL));
+        f.render_widget(p, area);
+        return;
+    } else if let Some(p) = path_to_preview {
+        p
     } else {
         return;
     };
@@ -685,14 +705,31 @@ fn run_app(
                             PanelFocus::Files => match key.code {
                                 KeyCode::Down | KeyCode::Char('j') => {
                                     app.select_next();
+                                    app.delayed_preview_path = Some(app.path.join(&app.files[app.selected]));
+                                    app.last_highlight_time = Instant::now();
                                     Ok(())
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     app.select_previous();
+                                    app.delayed_preview_path = Some(app.path.join(&app.files[app.selected]));
+                                    app.last_highlight_time = Instant::now();
                                     Ok(())
                                 }
-                                KeyCode::Enter => app.open_selected(),
-                                KeyCode::Char('u') => app.go_up_directory(),
+                                KeyCode::Enter => {
+                                    let result = app.open_selected();
+                                    // If a directory was opened, update the preview path and time
+                                    if app.path.join(&app.files[app.selected]).is_dir() {
+                                        app.delayed_preview_path = Some(app.path.join(&app.files[app.selected]));
+                                        app.last_highlight_time = Instant::now();
+                                    }
+                                    result
+                                }
+                                KeyCode::Char('u') => {
+                                    let result = app.go_up_directory();
+                                    app.delayed_preview_path = Some(app.path.join(&app.files[app.selected]));
+                                    app.last_highlight_time = Instant::now();
+                                    result
+                                }
                                 KeyCode::Char('d') => {
                                     app.delete_selected();
                                     Ok(())
