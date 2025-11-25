@@ -1,82 +1,35 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},execute,terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use nerd_font_symbols::md;
 use ratatui::{
-    prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    prelude::*,widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::{
-    env,
-    fs,
-    io::{self, Read},
-    path::{Path, PathBuf},
-    time::Instant,
+    env,fs,io::{self, Read},path::{Path, PathBuf},time::Instant,
 };
 use trash;
 use viuer;
 use open;
 
 const ACTIONS: &[(&str, &str)] = &[
-    ("Cut", "X"),
-    ("Copy", "C"),
-    ("Paste", "P"),
-    ("Delete", "D"),
-    ("Rename", "R"),
-    ("Create", "N"),
-    ("Create Directory", "+"),
-    ("Move", "M"),
-    ("Open", "O"),
-    ("Toggle Hidden", "Shift+H"),
+    ("Cut", "X"),("Copy", "C"),("Paste", "V"),("Delete", "D"),("Rename", "R"),("Create", "N"),("Create Directory", "+"),("Move", "M"),("Open", "O"),("Toggle Hidden", "Shift+H"),
 ];
 const VIM_KEY_HINTS: &[(&str, &str, &str)] = &[
-    ("J", "Down Arrow", "Move down in file list"),
-    ("K", "Up Arrow", "Move up in file list"),
-    ("H", "Left Arrow", "Unfocus actions panel / Go up directory"),
-    ("L", "Right Arrow", "Focus actions panel / Open selected"),
-    ("Q", "Quit", "Quit the application"),
+    ("J", "Down Arrow", "Move down in file list"),("K", "Up Arrow", "Move up in file list"),("H", "Left Arrow", "Unfocus actions panel / Go up directory"),("L", "Right Arrow", "Focus actions panel / Open selected"),("Q", "Quit", "Quit the application"),
 ];
 
 #[derive(PartialEq)]
 enum AppMode {
-    Normal,
-    ConfirmDelete,
-    Editing,
-    Create,
-    Rename,
-    Filter,
-    CreateDirectory,
-    Move,
+    Normal,ConfirmDelete,Editing,Create,Rename,Filter,CreateDirectory,Move,
 }
 #[derive(PartialEq)]
 enum PanelFocus {
-    Files,
-    Actions,
+    Files,Actions,
 }
 struct App {
-    path: PathBuf,
-    files: Vec<String>,
-    selected: usize,
-    mode: AppMode,
-    address_input: String,
-    cursor_position: usize,
-    create_input: String,
-    rename_input: String,
-    clipboard: Option<PathBuf>,
-    is_cut: bool,
-    show_hidden: bool,
-    filter_input: String,
-    create_directory_input: String,
-    move_input: String,
-    selected_action: usize,
-    panel_focus: PanelFocus,
-    action_list_state: ListState,
-    error_message: Option<String>,
-    delayed_preview_path: Option<PathBuf>,
-    last_highlight_time: Instant,
+    path: PathBuf,files: Vec<String>,selected: usize,mode: AppMode,address_input: String,cursor_position: usize,create_input: String,rename_input: String,clipboard: Option<PathBuf>,is_cut: bool,show_hidden: bool,filter_input: String,create_directory_input: String,move_input: String,selected_action: usize,panel_focus: PanelFocus,action_list_state: ListState,error_message: Option<String>,delayed_preview_path: Option<PathBuf>,last_highlight_time: Instant,notification: Option<String>,notification_time: Option<Instant>,
 }
 impl App {
     fn new(path: PathBuf) -> Result<Self> {
@@ -88,27 +41,7 @@ impl App {
             .to_string();
         let cursor_position = address_input.len();
         Ok(Self {
-            path: normalized_path,
-            files,
-            selected: 0,
-            mode: AppMode::Normal,
-            address_input,
-            cursor_position,
-            create_input: String::new(),
-            rename_input: String::new(),
-            clipboard: None,
-            is_cut: false,
-            show_hidden: true,
-            filter_input: String::new(),
-            create_directory_input: String::new(),
-            move_input: String::new(),
-            selected_action: 0,
-            panel_focus: PanelFocus::Files,
-            action_list_state: ListState::default(),
-            error_message: None,
-            delayed_preview_path: None,
-            last_highlight_time: Instant::now(),
-        })
+            path: normalized_path,files,selected: 0,mode: AppMode::Normal,address_input,cursor_position,create_input: String::new(),rename_input: String::new(),clipboard: None,is_cut: false,show_hidden: true,filter_input: String::new(),create_directory_input: String::new(),move_input: String::new(),selected_action: 0,panel_focus: PanelFocus::Files,action_list_state: ListState::default(),error_message: None,delayed_preview_path: None,last_highlight_time: Instant::now(),notification: None,notification_time: None, })
     }
     fn normalize_path(path: &Path) -> Result<PathBuf> {
         if path.starts_with("~") {
@@ -201,34 +134,41 @@ impl App {
         self.mode = AppMode::ConfirmDelete;
     }
     fn confirm_delete(&mut self) -> Result<()> {
-        let selected_file = &self.files[self.selected];
-        let path = self.path.join(selected_file);
+        let selected_file = self.files[self.selected].clone();
+        let path = self.path.join(&selected_file);
         trash::delete(path)?;
         self.files = Self::get_files(&self.path, self.show_hidden)?;
         self.selected = 0;
         self.mode = AppMode::Normal;
+        self.notification = Some(format!("Deleted '{}'", selected_file));
+        self.notification_time = Some(Instant::now());
         Ok(())
     }
     fn cancel_delete(&mut self) {
         self.mode = AppMode::Normal;
     }
     fn copy_selected(&mut self) {
-        let selected_file = &self.files[self.selected];
-        let path = self.path.join(selected_file);
+        let selected_file = self.files[self.selected].clone();
+        let path = self.path.join(&selected_file);
         self.clipboard = Some(path);
+        self.notification = Some(format!("Copied '{}'", selected_file));
+        self.notification_time = Some(Instant::now());
     }
     fn cut_selected(&mut self) {
-        let selected_file = &self.files[self.selected];
-        let path = self.path.join(selected_file);
+        let selected_file = self.files[self.selected].clone();
+        let path = self.path.join(&selected_file);
         self.clipboard = Some(path);
         self.is_cut = true;
         self.mode = AppMode::Normal;
+        self.notification = Some(format!("Cut '{}'", selected_file));
+        self.notification_time = Some(Instant::now());
     }
     fn paste(&mut self) -> Result<()> {
         if let Some(from) = self.clipboard.clone() {
+            let file_name = from.file_name().context("Failed to get file name")?;
             let to = self
                 .path
-                .join(from.file_name().context("Failed to get file name")?);
+                .join(file_name);
             if from.is_dir() {
                 fs::create_dir_all(&to)?;
                 for entry in fs::read_dir(from.clone())? {
@@ -250,6 +190,8 @@ impl App {
                 self.clipboard = None;
             }
             self.files = Self::get_files(&self.path, self.show_hidden)?;
+            self.notification = Some(format!("Pasted '{}'", file_name.to_string_lossy()));
+            self.notification_time = Some(Instant::now());
         }
         Ok(())
     }
@@ -281,13 +223,11 @@ fn ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(f.area());
-    let address_bar = render_address_bar(app);
+    let address_bar = render_address_bar(app, main_chunks[0].width);
     f.render_widget(address_bar, main_chunks[0]);
     if app.mode == AppMode::Editing {
         f.set_cursor_position(Position::new(
-            main_chunks[0].x + app.cursor_position as u16 + 1,
-            main_chunks[0].y + 1,
-        ));
+            main_chunks[0].x + app.cursor_position as u16 + 1,main_chunks[0].y + 1, ));
     }
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -344,9 +284,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let p = Paragraph::new(app.create_input.as_str());
         f.render_widget(p, area);
         f.set_cursor_position(Position::new(
-            area.x + app.create_input.len() as u16 + 1,
-            area.y + 1,
-        ));
+            area.x + app.create_input.len() as u16 + 1, area.y + 1,));
     }
     if let AppMode::Rename = app.mode {
         let block = Block::default().title("Rename").borders(Borders::ALL);
@@ -356,9 +294,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let p = Paragraph::new(app.rename_input.as_str());
         f.render_widget(p, area);
         f.set_cursor_position(Position::new(
-            area.x + app.rename_input.len() as u16 + 1,
-            area.y + 1,
-        ));
+            area.x + app.rename_input.len() as u16 + 1, area.y + 1,));
     }
     if let AppMode::Filter = app.mode {
         let block = Block::default().title("Filter").borders(Borders::ALL);
@@ -368,9 +304,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let p = Paragraph::new(app.filter_input.as_str());
         f.render_widget(p, area);
         f.set_cursor_position(Position::new(
-            area.x + app.filter_input.len() as u16 + 1,
-            area.y + 1,
-        ));
+            area.x + app.filter_input.len() as u16 + 1,area.y + 1, ));
     }
     if let AppMode::CreateDirectory = app.mode {
         let block = Block::default()
@@ -382,9 +316,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let p = Paragraph::new(app.create_directory_input.as_str());
         f.render_widget(p, area);
         f.set_cursor_position(Position::new(
-            area.x + app.create_directory_input.len() as u16 + 1,
-            area.y + 1,
-        ));
+            area.x + app.create_directory_input.len() as u16 + 1,area.y + 1, ));
     }
     if let AppMode::Move = app.mode {
         let block = Block::default().title("Move").borders(Borders::ALL);
@@ -394,9 +326,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let p = Paragraph::new(app.move_input.as_str());
         f.render_widget(p, area);
         f.set_cursor_position(Position::new(
-            area.x + app.move_input.len() as u16 + 1,
-            area.y + 1,
-        ));
+            area.x + app.move_input.len() as u16 + 1,area.y + 1, ));
 }
 }
 fn render_key_hints(f: &mut Frame, area: Rect) {
@@ -413,19 +343,36 @@ fn render_key_hints(f: &mut Frame, area: Rect) {
             Block::default()
                 .title("Key Hints")
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Reset)),
-        )
+                .style(Style::default().bg(Color::Reset)), )
         .alignment(Alignment::Center); // Center the text for better appearance
     f.render_widget(paragraph, area);
 }
 
-fn render_address_bar<'a>(app: &'a App) -> Paragraph<'a> {
+fn render_address_bar(app: &App, width: u16) -> Paragraph<'_> {
     let path_str = if app.mode == AppMode::Editing {
         app.address_input.as_str()
     } else {
         app.path.to_str().unwrap_or("Karu")
     };
-    Paragraph::new(path_str).block(Block::default().title("Address").borders(Borders::ALL))
+
+    let mut spans = vec![Span::raw(path_str)];
+
+    if let Some(notification) = &app.notification {
+        let notification_span = Span::styled(
+            notification,Style::default().fg(Color::Yellow), );
+        let padding_len = width as usize
+            - path_str.len()
+            - notification.len()
+            - 2; // for borders
+        if padding_len > 0 {
+            let padding = " ".repeat(padding_len);
+            spans.push(Span::raw(padding));
+        }
+        spans.push(notification_span);
+    }
+
+    Paragraph::new(Line::from(spans))
+        .block(Block::default().title("Address").borders(Borders::ALL))
 }
 fn render_file_list<'a>(app: &'a App, max_width: u16, panel_focus: &PanelFocus) -> List<'a> {
     let items: Vec<ListItem> = app
@@ -462,10 +409,7 @@ fn render_file_list<'a>(app: &'a App, max_width: u16, panel_focus: &PanelFocus) 
             let padding = " ".repeat(padding_width);
 
             let mut spans = vec![
-                Span::styled(glyph.trim(), style),
-                Span::styled(format!("  {display_name_str}"), style),
-                Span::raw(padding),
-            ];
+                Span::styled(glyph.trim(), style), Span::styled(format!("  {display_name_str}"), style), Span::raw(padding),];
 
             if !is_dir {
                 if let Ok(metadata) = fs::metadata(&path) {
@@ -487,8 +431,7 @@ fn render_file_list<'a>(app: &'a App, max_width: u16, panel_focus: &PanelFocus) 
             .highlight_style(
                 Style::default()
                     .bg(Color::Rgb(70, 70, 70))
-                    .add_modifier(Modifier::BOLD),
-            )
+                    .add_modifier(Modifier::BOLD),)
             .highlight_symbol("> ");
     }
     list
@@ -501,16 +444,14 @@ fn render_context_menu(panel_focus: &PanelFocus) -> List<'_> {
     let mut list = List::new(items)
         .block(
             Block::default()
-                .title("Actions")
-                .borders(Borders::ALL),
-        );
+                .title("Menu")
+                .borders(Borders::ALL), );
     if let PanelFocus::Actions = panel_focus {
         list = list
             .highlight_style(
                 Style::default()
                     .bg(Color::Rgb(50, 50, 50))
-                    .add_modifier(Modifier::BOLD),
-            )
+                    .add_modifier(Modifier::BOLD),)
             .highlight_symbol("> ");
     }
     list
@@ -547,9 +488,7 @@ fn render_preview(f: &mut Frame, area: Rect, path_to_preview: Option<PathBuf>, l
         const MAX_PREVIEW_SIZE_BYTES: u64 = MAX_PREVIEW_SIZE_MB * 1024 * 1024; // 300 MB in bytes
         if metadata.len() > MAX_PREVIEW_SIZE_BYTES {
             let p = Paragraph::new(format!(
-                "File is too large for preview ({}) Max size is {} MB.",
-                format_size(metadata.len()),
-                MAX_PREVIEW_SIZE_MB
+                "File is too large for preview ({}) Max size is {} MB.", format_size(metadata.len()), MAX_PREVIEW_SIZE_MB
             ))
             .block(Block::default().title("Preview").borders(Borders::ALL));
             f.render_widget(p, area);
@@ -559,15 +498,9 @@ fn render_preview(f: &mut Frame, area: Rect, path_to_preview: Option<PathBuf>, l
     if is_image(&path) {
         if let Ok(_img) = image::open(&path) {
             let inner_area = area.inner(Margin {
-                horizontal: 1,
-                vertical: 1,
-            });
+                horizontal: 1, vertical: 1,});
             let config = viuer::Config {
-                x: inner_area.x,
-                y: inner_area.y as i16,
-                width: Some(inner_area.width as u32),
-                height: Some(inner_area.height as u32),
-                ..Default::default()
+                x: inner_area.x, y: inner_area.y as i16, width: Some(inner_area.width as u32), height: Some(inner_area.height as u32), ..Default::default()
             };
             viuer::print_from_file(path, &config).expect("Image printing failed.");
             // Draw the block and borders after the image to make them visible
@@ -613,8 +546,7 @@ fn is_image(path: &Path) -> bool {
     let extension = path.extension().and_then(|s| s.to_str());
     if let Some(ext) = extension {
         matches!(
-            ext.to_lowercase().as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "tiff" | "webp"
+            ext.to_lowercase().as_str(),"png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "tiff" | "webp"
         )
     } else {
         false
@@ -626,14 +558,10 @@ fn is_likely_binary(path: &Path) -> bool {
         return false;
     }
     let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
+        Ok(file) => file, Err(_) => return false,};
     let mut buffer = [0; 1024];
     let n = match file.read(&mut buffer) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
+        Ok(n) => n, Err(_) => return false,};
     for &byte in &buffer[..n] {
         if byte == 0 {
             return true;
@@ -660,31 +588,29 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .direction(Direction::Vertical)
         .constraints(
             [
-                Constraint::Percentage((100 - percent_y) / 2),
-                Constraint::Percentage(percent_y),
-                Constraint::Percentage((100 - percent_y) / 2),
-            ]
-            .as_ref(),
-        )
+                Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2),]
+            .as_ref(), )
         .split(r);
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints(
             [
-                Constraint::Percentage((100 - percent_x) / 2),
-                Constraint::Percentage(percent_x),
-                Constraint::Percentage((100 - percent_x) / 2),
-            ]
-            .as_ref(),
-        )
+                Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2),]
+            .as_ref(), )
         .split(popup_layout[1])[1]
 }
 fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,app: &mut App,
 ) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
+
+        if let Some(notification_time) = app.notification_time {
+            if notification_time.elapsed().as_secs() > 2 {
+                app.notification = None;
+                app.notification_time = None;
+            }
+        }
 
         if crossterm::event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
@@ -750,10 +676,9 @@ fn run_app(
                                     app.cut_selected();
                                     Ok(())
                                 }
-                                KeyCode::Char('p') => app.paste(),
+                                KeyCode::Char('v') => app.paste(),
 
-                                KeyCode::Char('o') => app.open_file(),
-                                KeyCode::Char('H')
+                                KeyCode::Char('o') => app.open_file(),                 KeyCode::Char('H')
                                     if key.modifiers.contains(KeyModifiers::SHIFT) =>
                                 {
                                     app.toggle_hidden_files()
@@ -783,17 +708,16 @@ fn run_app(
                                     Ok(())
                                 }
                                 _ => Ok(()), // Ignore other keys
-                            },
-                            PanelFocus::Actions => {
+                            },             PanelFocus::Actions => {
                                 match key.code {
-                                    KeyCode::Up => {
+                                    KeyCode::Up | KeyCode::Char('k')=> {
                                         if app.selected_action > 0 {
                                             app.selected_action -= 1;
                                             app.action_list_state
                                                 .select(Some(app.selected_action));
                                         }
                                     }
-                                    KeyCode::Down => {
+                                    KeyCode::Down | KeyCode::Char('j') => {
                                         if app.selected_action < ACTIONS.len() - 1 {
                                             app.selected_action += 1;
                                             app.action_list_state
@@ -805,19 +729,12 @@ fn run_app(
                                     }
                                     KeyCode::Enter => {
                                         match app.selected_action {
-                                            0 => app.cut_selected(),
-                                            1 => app.copy_selected(),
-                                            2 => {
+                                            0 => app.cut_selected(),                             1 => app.copy_selected(),                             2 => {
                                                 if let Err(e) = app.paste() {
                                                     app.error_message = Some(e.to_string())
                                                 }
                                             }
-                                            3 => app.delete_selected(),
-                                            4 => app.mode = AppMode::Rename,
-                                            5 => app.mode = AppMode::Create,
-                                            6 => app.mode = AppMode::CreateDirectory,
-                                            7 => app.mode = AppMode::Move,
-                                            8 => {
+                                            3 => app.delete_selected(), 4 => app.mode = AppMode::Rename, 5 => app.mode = AppMode::Create, 6 => app.mode = AppMode::CreateDirectory, 7 => app.mode = AppMode::Move,                             8 => {
                                                 if let Err(e) = app.open_file() {
                                                     app.error_message = Some(e.to_string())
                                                 }
@@ -843,14 +760,12 @@ fn run_app(
                         }
                     }
                     AppMode::ConfirmDelete => match key.code {
-                        KeyCode::Char('y') => app.confirm_delete(),
-                        KeyCode::Char('n') => {
+                        KeyCode::Char('y') => app.confirm_delete(), KeyCode::Char('n') => {
                             app.cancel_delete();
                             Ok(())
                         }
                         _ => Ok(()), // Ignore other keys
-                    },
-                    AppMode::Editing => match key.code {
+                    },     AppMode::Editing => match key.code {
                         KeyCode::Char(c) => {
                             app.address_input.insert(app.cursor_position, c);
                             app.cursor_position += 1;
@@ -878,8 +793,7 @@ fn run_app(
                             Ok(())
                         }
                         _ => Ok(()), // Ignore other keys
-                    },
-                    AppMode::Create => match key.code {
+                    },     AppMode::Create => match key.code {
                         KeyCode::Char(c) => {
                             app.create_input.push(c);
                             Ok(())
@@ -906,8 +820,7 @@ fn run_app(
                             Ok(())
                         }
                         _ => Ok(()), // Ignore other keys
-                    },
-                    AppMode::Rename => match key.code {
+                    },     AppMode::Rename => match key.code {
                         KeyCode::Char(c) => {
                             app.rename_input.push(c);
                             Ok(())
@@ -917,10 +830,14 @@ fn run_app(
                             Ok(())
                         }
                         KeyCode::Enter => {
-                            let old_path = app.path.join(&app.files[app.selected]);
+                            let old_path = app.path.join(&app.files[app.selected].clone());
                             let new_path = app.path.join(&app.rename_input);
-                            fs::rename(old_path, new_path)?;
+                            fs::rename(&old_path, &new_path)?;
                             app.files = App::get_files(&app.path, app.show_hidden)?;
+                            app.notification = Some(format!(
+                                "Renamed '{}' to '{}'",                 old_path.file_name().unwrap().to_str().unwrap(),                 new_path.file_name().unwrap().to_str().unwrap()
+                            ));
+                            app.notification_time = Some(Instant::now());
                             app.rename_input.clear();
                             app.mode = AppMode::Normal;
                             Ok(())
@@ -931,8 +848,7 @@ fn run_app(
                             Ok(())
                         }
                         _ => Ok(()), // Ignore other keys
-                    },
-                    AppMode::Filter => match key.code {
+                    },     AppMode::Filter => match key.code {
                         KeyCode::Char(c) => {
                             app.filter_input.push(c);
                             Ok(())
@@ -955,8 +871,7 @@ fn run_app(
                             Ok(())
                         }
                         _ => Ok(()), // Ignore other keys
-                    },
-                    AppMode::CreateDirectory => match key.code {
+                    },     AppMode::CreateDirectory => match key.code {
                         KeyCode::Char(c) => {
                             app.create_directory_input.push(c);
                             Ok(())
@@ -979,8 +894,7 @@ fn run_app(
                             Ok(())
                         }
                         _ => Ok(()), // Ignore other keys
-                    },
-                    AppMode::Move => match key.code {
+                    },     AppMode::Move => match key.code {
                         KeyCode::Char(c) => {
                             app.move_input.push(c);
                             Ok(())
@@ -1003,9 +917,7 @@ fn run_app(
                             app.mode = AppMode::Normal;
                             Ok(())
                         }
-                        _ => Ok(()),
-                    },
-                };
+                        _ => Ok(()),     }, };
                 if let Err(e) = result {
                     app.error_message = Some(e.to_string());
                 }
@@ -1023,9 +935,7 @@ fn main() -> Result<()> {
     let res = run_app(&mut terminal, &mut app);
     disable_raw_mode()?;
     execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture
     )?;
     terminal.show_cursor()?;
     if let Err(err) = res {
